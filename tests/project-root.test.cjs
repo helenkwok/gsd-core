@@ -134,7 +134,7 @@ describe('findProjectRoot nearest-.planning resolution (#1414)', () => {
     fs.mkdirSync(path.join(tmpDir, '.planning'), { recursive: true });
 
     // Invoke from a subdirectory of "home".
-    const sub = mkDeep(tmpDir, 'sub', 'dir');
+    const sub = mkDeep(tmpDir, 'sub', process.platform === 'win32' ? 'junction' : 'dir');
 
     const result = findProjectRoot(sub);
     assert.strictEqual(result, tmpDir,
@@ -341,7 +341,7 @@ describe('findProjectRoot nearest-.planning resolution (#1414)', () => {
     const externalStore = mkDeep(tmpDir, '..', 'external-planning-store');
     fs.mkdirSync(path.join(externalStore, '.git'), { recursive: true });
     fs.mkdirSync(path.join(externalStore, 'phases', '01-x'), { recursive: true });
-    fs.symlinkSync(externalStore, path.join(tmpDir, '.planning'), 'dir');
+    fs.symlinkSync(externalStore, path.join(tmpDir, '.planning'), process.platform === 'win32' ? 'junction' : 'dir');
     const startDir = mkDeep(tmpDir, 'src', 'lib');
 
     const result = findProjectRoot(startDir);
@@ -358,12 +358,34 @@ describe('findProjectRoot nearest-.planning resolution (#1414)', () => {
     const externalStore = mkDeep(tmpDir, '..', 'external-planning-store-2');
     fs.mkdirSync(path.join(externalStore, '.git'), { recursive: true });
     fs.mkdirSync(path.join(externalStore, 'phases', '01-x'), { recursive: true });
-    fs.symlinkSync(externalStore, path.join(tmpDir, '.planning'), 'dir');
+    fs.symlinkSync(externalStore, path.join(tmpDir, '.planning'), process.platform === 'win32' ? 'junction' : 'dir');
     const startDir = path.join(tmpDir, '.planning', 'phases', '01-x');
 
     const result = findProjectRoot(startDir);
     assert.strictEqual(result, tmpDir,
       'invoking from inside the symlinked .planning/ tree (e.g. a phase directory, ' +
       `matching computeCoveredDigest's real call shape) must still resolve to tmpDir. Got: ${result}`);
+  });
+
+  // Counter-case scoping #4815's fix: only a symlinked `.planning` is exempt
+  // from the git-boundary check. A nested child repo reached through any OTHER
+  // symlinked directory is still a real repo boundary (#2843) and must still
+  // stop the walk from resolving to the ancestor project.
+  test('#2843 still refuses a nested child repo reached through a symlinked non-.planning ancestor', () => {
+    // tmpDir/parent-gsd/.planning/     <- ancestor GSD project
+    // tmpDir/parent-gsd/link -> tmpDir/real-child/   (symlink, NOT .planning)
+    // tmpDir/real-child/.git           <- nested child repo, no .planning
+    // startDir = tmpDir/parent-gsd/link/src
+    const parentGsd = mkDeep(tmpDir, 'parent-gsd');
+    fs.mkdirSync(path.join(parentGsd, '.planning'), { recursive: true });
+    const realChild = mkDeep(tmpDir, 'real-child');
+    fs.mkdirSync(path.join(realChild, '.git'), { recursive: true });
+    mkDeep(realChild, 'src');
+    fs.symlinkSync(realChild, path.join(parentGsd, 'link'), process.platform === 'win32' ? 'junction' : 'dir');
+    const startDir = path.join(parentGsd, 'link', 'src');
+
+    const result = findProjectRoot(startDir);
+    assert.notStrictEqual(result, parentGsd,
+      'a symlinked non-.planning directory holding a nested repo must still count as a git boundary');
   });
 });
