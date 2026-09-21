@@ -19,6 +19,23 @@ import os from 'node:os';
 
 const FIND_PROJECT_ROOT_MAX_DEPTH = 10;
 
+// #4894: an operator-supplied `--project-dir` IS the project root — the
+// dispatcher validates it and skips the ancestor walk-up for `cwd`, but code
+// that derives a root from a PHASE DIRECTORY (verification) never sees `cwd`.
+// The dispatcher records the validated root here, once per process, and those
+// callers resolve through `resolveProjectRoot`. `null` (the default, and what
+// the dispatcher sets when the flag is absent) leaves `findProjectRoot`'s
+// walk-up as the only source of truth, so no-flag behavior is unchanged.
+let explicitProjectRoot: string | null = null;
+
+export function setExplicitProjectRoot(root: string | null): void {
+  explicitProjectRoot = root;
+}
+
+export function resolveProjectRoot(startDir: string): string {
+  return explicitProjectRoot ?? findProjectRoot(startDir);
+}
+
 export function findProjectRoot(startDir: string): string {
   let resolvedStart: string;
   try {
