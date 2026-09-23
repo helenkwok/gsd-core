@@ -3290,4 +3290,34 @@ describe('#4894 --project-dir reaches verification root resolution', () => {
     writeReport(`status: passed\ncovered_files:\n  - src/a.txt\ncovered_digest: "v2:sha256:${'0'.repeat(64)}"`);
     assert.equal(status(['--project-dir', proj]), 'stale', 'a digest that does not match the files');
   });
+
+  // The MCP server never calls setExplicitProjectRoot itself: `gsd_invoke_command`
+  // reaches `dispatchGsdCommand`, which runs each command as a gsd-tools.cjs
+  // SUBPROCESS, so the flag is honored by that child's main(). Pin it through
+  // the real JSON-RPC surface so a future in-process dispatcher cannot silently
+  // drop the flag on this path.
+  test('criterion 5: --project-dir reaches verification through the MCP server (gsd_invoke_command)', () => {
+    const { handleMessage } = require('../gsd-core/bin/lib/mcp-server.cjs');
+    const invoke = (family, subcommand, args) => handleMessage(
+      { jsonrpc: '2.0', id: 1, method: 'tools/call',
+        params: { name: 'gsd_invoke_command', arguments: { family, subcommand, args } } },
+      { cwd: base },
+    ).result;
+
+    const reference = referenceDigest();
+    const fp = invoke('verification', 'fingerprint', [realPhaseDir, 'src/a.txt', '--project-dir', proj]);
+    assert.ok(!fp.isError, `MCP fingerprint should succeed: ${fp.content[0].text}`);
+    assert.equal(fp.content[0].text.trim(), reference, 'MCP --raw digest == in-root CLI digest');
+    assert.ok(invoke('verification', 'fingerprint', [realPhaseDir, 'src/a.txt']).isError,
+      'no flag over MCP: still the wrong root, as before');
+
+    writeReport(`status: passed\ncovered_files:\n  - src/a.txt\ncovered_digest: "${reference}"`);
+    const mcpStatus = (args) => {
+      const r = invoke('query', 'verification.status', [realPhaseDir, ...args]);
+      assert.ok(!r.isError, `MCP verification.status should run: ${r.content[0].text}`);
+      return JSON.parse(r.content[0].text).status;
+    };
+    assert.equal(mcpStatus(['--project-dir', proj]), 'passed');
+    assert.equal(mcpStatus([]), 'stale', 'no flag over MCP: unchanged');
+  });
 });
