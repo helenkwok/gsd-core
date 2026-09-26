@@ -276,10 +276,10 @@ function git(args, { cwd = REPO_ROOT } = {}) {
  * "nothing changed" would make every moved hash unattributable and produce a failure
  * storm that reads exactly like a real finding.
  */
-function resolveChangedPaths(base = 'origin/next') {
+function resolveChangedPaths(base = 'origin/next', { cwd = REPO_ROOT } = {}) {
   let out;
   try {
-    out = git(['diff', '--name-only', `${base}...HEAD`]);
+    out = git(['diff', '--name-only', `${base}...HEAD`], { cwd });
   } catch (err) {
     throw new Error(
       `emitted-attribution: could not resolve changed paths from "${base}...HEAD": ${err.message}. ` +
@@ -328,14 +328,55 @@ function baseRefCandidates(env = process.env) {
  * failure would make the suite permanently red in the gsd-test container, where no
  * base ref can exist by construction.
  */
-function resolveBase(env = process.env) {
+function resolveBase(env = process.env, { cwd = REPO_ROOT } = {}) {
   for (const candidate of baseRefCandidates(env)) {
     try {
-      const sha = git(['rev-parse', '--verify', `${candidate}^{commit}`]).trim();
+      const sha = git(['rev-parse', '--verify', `${candidate}^{commit}`], { cwd }).trim();
       if (/^[0-9a-f]{40}$/.test(sha)) return { ref: candidate, sha };
     } catch { /* try the next candidate */ }
   }
   return null;
+}
+
+/**
+ * The commit the differential gate measures FROM: the merge-base of the resolved base
+ * ref and HEAD, alongside the base tip it was derived from.
+ *
+ * The baseline manifests, the changed-path range (`resolveChangedPaths`'s three-dot
+ * diff) and the ack-trailer range (`readAckTrailers`) must all start at ONE commit, or
+ * a change that landed only on the base side after HEAD forked shows up in
+ * baseline-vs-current while no path in `merge-base..HEAD` explains it (#5008). That is
+ * exactly what `release.yml`'s finalize lane hit: it tests `release/X.Y.Z` as is (never
+ * merged onto `next`), `next` gained #4937 between `create` and `finalize`, and a
+ * baseline built at the `next` TIP attributed that merge to the release branch.
+ *
+ * PR lanes merge the tree onto `pull_request.base.sha` first, so there the merge-base
+ * IS the base tip and the cache key (`emitted-baseline-<base.sha>`) still hits.
+ *
+ * Null when no base ref resolves (the caller's explicit-skip path, same as
+ * `resolveBase`). A merge-base failure once a base DOES resolve THROWS: the three-dot
+ * diff needs the same commit, so a silent fallback to the tip would reintroduce the
+ * mismatch this exists to close.
+ *
+ * @returns {{ ref: string, tipSha: string, sha: string } | null} `sha` is the merge-base.
+ */
+function resolveAttributionBase(env = process.env, { cwd = REPO_ROOT } = {}) {
+  const resolved = resolveBase(env, { cwd });
+  if (!resolved) return null;
+  let sha;
+  try {
+    sha = git(['merge-base', resolved.sha, 'HEAD'], { cwd }).trim();
+  } catch (err) {
+    throw new Error(
+      `emitted-attribution: could not resolve the merge-base of "${resolved.ref}" and HEAD: ${err.message}. ` +
+      'This is a hard error on purpose — measuring the baseline at the base tip instead ' +
+      'would attribute base-only merges to this tree.',
+    );
+  }
+  if (!/^[0-9a-f]{40}$/.test(sha)) {
+    throw new Error(`emitted-attribution: merge-base of "${resolved.ref}" and HEAD is not a 40-hex sha: ${JSON.stringify(sha)}`);
+  }
+  return { ref: resolved.ref, tipSha: resolved.sha, sha };
 }
 
 /**
@@ -971,6 +1012,7 @@ module.exports = {
   resolveBaseSha,
   baseRefCandidates,
   resolveBase,
+  resolveAttributionBase,
   baselineFamilyNamesAtRef,
   baselineManifestsAtRef,
   baselineSizesAtRef,

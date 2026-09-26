@@ -43,7 +43,7 @@ const { cleanup, createTempDir } = require('./helpers.cjs');
 const { BUILD_SCRIPT, buildParityManifest, buildInstallTree, PKG_VERSION } = require('./helpers/install-shared.cjs');
 const {
   resolveChangedPaths,
-  resolveBase,
+  resolveAttributionBase,
   baseRefCandidates,
   buildBaselineAtRef,
   currentManifests,
@@ -2081,6 +2081,121 @@ test('property: reported added/dropped are exactly the set differences', () => {
   );
 });
 
+// ── #5008: the baseline commit and the attribution range share ONE origin ────────
+//
+// The release finalize lane tests `release/X.Y.Z` as is, never merged onto `next`. When
+// `next` advanced between `create` and `finalize` (#4937 landed in between for v1.15.0),
+// the real-tree test built its baseline at the `next` TIP while `resolveChangedPaths`
+// and `readAckTrailers` measure from the merge-base — so #4937's regenerated
+// `scripts/lib/platform-conformance-tier.generated.cjs` read as 19 unattributed emitted
+// paths on a release branch that never touched it. These pin the commit the gate
+// measures from against a real forked repo: a base that moved past the fork point by
+// 0 / 1 / 2 commits must always yield the fork point.
+
+/**
+ * Hermetic git in a throwaway repo: fixed identity, no signing, no global hooks. Shares
+ * `FRESH_FIXTURE_GIT_TIMEOUT_MS` with the other from-scratch git fixtures in this file
+ * rather than introducing a second timeout constant for the identical shape.
+ */
+function gitFixture(cwd, args) {
+  return execFileSync('git', [
+    '-c', 'user.name=gsd-test', '-c', 'user.email=gsd-test@example.invalid',
+    '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null',
+    ...safeDirArgs(cwd), ...args,
+  ], { cwd, encoding: 'utf8', timeout: FRESH_FIXTURE_GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+
+/**
+ * `next` @ fork -> `release` adds release-only.txt -> `next` advances `baseAdvance`
+ * commits, each rewriting shared.txt. HEAD is left on `release`.
+ */
+function makeForkedRepo(baseAdvance) {
+  const root = createTempDir('gsd-5008-merge-base-');
+  gitFixture(root, ['init', '-q', '-b', 'next']);
+  fs.writeFileSync(path.join(root, 'shared.txt'), 'v0\n');
+  gitFixture(root, ['add', '-A']);
+  gitFixture(root, ['commit', '-q', '-m', 'fork point']);
+  const forkSha = gitFixture(root, ['rev-parse', 'HEAD']);
+
+  gitFixture(root, ['checkout', '-q', '-b', 'release']);
+  fs.writeFileSync(path.join(root, 'release-only.txt'), 'release\n');
+  gitFixture(root, ['add', '-A']);
+  gitFixture(root, ['commit', '-q', '-m', 'release-only change']);
+
+  gitFixture(root, ['checkout', '-q', 'next']);
+  for (let i = 1; i <= baseAdvance; i++) {
+    fs.writeFileSync(path.join(root, 'shared.txt'), `v${i}\n`);
+    gitFixture(root, ['add', '-A']);
+    gitFixture(root, ['commit', '-q', '-m', `next-only change ${i}`]);
+  }
+  const tipSha = gitFixture(root, ['rev-parse', 'HEAD']);
+  gitFixture(root, ['checkout', '-q', 'release']);
+  return { root, forkSha, tipSha };
+}
+
+for (const baseAdvance of [0, 1, 2]) {
+  test(`#5008: base advanced ${baseAdvance} commit(s) past the fork — the gate measures from the merge-base`, () => {
+    const { root, forkSha, tipSha } = makeForkedRepo(baseAdvance);
+    try {
+      const r = resolveAttributionBase({ GSD_EMITTED_BASE: 'next' }, { cwd: root });
+      assert.ok(r, 'a resolvable base ref must not take the skip path');
+      assert.equal(r.ref, 'next');
+      assert.equal(r.tipSha, tipSha, 'tipSha must still report the live base tip');
+      assert.equal(r.sha, forkSha, 'the baseline commit must be the merge-base, never the base tip');
+      assert.equal(r.sha === r.tipSha, baseAdvance === 0,
+        'merge-base and tip coincide exactly when the base has not moved');
+
+      // The invariant the real-tree gate depends on: the change range starting at r.sha
+      // is exactly what HEAD did, and a base-only change is invisible from r.sha.
+      assert.deepEqual(resolveChangedPaths('next', { cwd: root }), ['release-only.txt']);
+      const headShared = gitFixture(root, ['show', 'HEAD:shared.txt']);
+      assert.equal(gitFixture(root, ['show', `${r.sha}:shared.txt`]), headShared,
+        'a path only the base changed must be identical between the baseline commit and HEAD');
+      if (baseAdvance > 0) {
+        // Proves the fixture exercises the defect: at the TIP, shared.txt moved while
+        // resolveChangedPaths never lists it — the pre-fix unattributed-drift shape.
+        assert.notEqual(gitFixture(root, ['show', `${r.tipSha}:shared.txt`]), headShared);
+      }
+    } finally {
+      cleanup(root);
+    }
+  });
+}
+
+test('#5008: no resolvable base ref still returns null (explicit-skip path preserved)', () => {
+  const root = createTempDir('gsd-5008-no-base-');
+  try {
+    gitFixture(root, ['init', '-q', '-b', 'trunk']);
+    fs.writeFileSync(path.join(root, 'a.txt'), 'a\n');
+    gitFixture(root, ['add', '-A']);
+    gitFixture(root, ['commit', '-q', '-m', 'only commit']);
+    assert.equal(resolveAttributionBase({}, { cwd: root }), null);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('#5008: unrelated histories throw — never a silent fallback to the base tip', () => {
+  const root = createTempDir('gsd-5008-unrelated-');
+  try {
+    gitFixture(root, ['init', '-q', '-b', 'release']);
+    fs.writeFileSync(path.join(root, 'r.txt'), 'r\n');
+    gitFixture(root, ['add', '-A']);
+    gitFixture(root, ['commit', '-q', '-m', 'release root']);
+    gitFixture(root, ['checkout', '-q', '--orphan', 'next']);
+    fs.writeFileSync(path.join(root, 'n.txt'), 'n\n');
+    gitFixture(root, ['add', '-A']);
+    gitFixture(root, ['commit', '-q', '-m', 'unrelated next root']);
+    gitFixture(root, ['checkout', '-q', 'release']);
+    assert.throws(
+      () => resolveAttributionBase({ GSD_EMITTED_BASE: 'next' }, { cwd: root }),
+      /could not resolve the merge-base of "next" and HEAD/,
+    );
+  } finally {
+    cleanup(root);
+  }
+});
+
 // ─── The real thing: the law, run against the actual tree ───────────────────
 //
 // Everything above exercises the pure law against synthetic input, which is what makes
@@ -2124,7 +2239,7 @@ test('differential attribution over the real tree', { timeout: HEAVY_REAL_TREE_T
   // a PASS (ADR-2719 §6). Hard-failing instead would make the suite permanently red
   // wherever a base ref cannot exist by construction, which is not a propagation
   // finding — it is a statement about the checkout.
-  const resolved = resolveBase();
+  const resolved = resolveAttributionBase();
   if (!resolved) {
     t.skip(
       'no base ref resolvable — tried ' + baseRefCandidates().join(', ') +
@@ -2133,6 +2248,10 @@ test('differential attribution over the real tree', { timeout: HEAVY_REAL_TREE_T
     );
     return;
   }
+  // #5008: `baseSha` is the MERGE-BASE of `base` and HEAD, never the base tip. The
+  // baseline below, `resolveChangedPaths(base)` (three-dot) and `readAckTrailers`
+  // (merge-base..HEAD) must all measure from that one commit; a baseline at the tip
+  // turns every base-only merge since HEAD forked into "unattributed" drift here.
   const { ref: base, sha: baseSha } = resolved;
   assert.match(baseSha, /^[0-9a-f]{40}$/);
 
@@ -2147,14 +2266,14 @@ test('differential attribution over the real tree', { timeout: HEAVY_REAL_TREE_T
   const resolvedBaseline = resolveBaseline({
     expectedSha: baseSha,
     readJson: readBaselineJson,
-    buildFallback: () => buildBaselineAtRef(base),
+    buildFallback: () => buildBaselineAtRef(baseSha),
   });
   assert.ok(
     resolvedBaseline.ok,
     // #2854: report the sources actually reached, not a hardcoded list of all three. An
     // early return could claim it "tried an in-job build" it never called, which sent
     // contributors hunting a rebuild that had not run.
-    `no usable emitted baseline for ${base}@${baseSha.slice(0, 12)} (tried ` +
+    `no usable emitted baseline for merge-base(${base}, HEAD)@${baseSha.slice(0, 12)} (tried ` +
     `${(resolvedBaseline.attempted || []).join(', ') || 'nothing'}):` +
     `\n  ${(resolvedBaseline.errors || []).join('\n  ')}`,
   );
@@ -2215,7 +2334,7 @@ test('differential attribution over the real tree', { timeout: HEAVY_REAL_TREE_T
 
   assert.ok(
     result.ok,
-    `emitted-attribution failed against ${base}@${baseSha.slice(0, 12)}:\n\n${formatReport(result)}`,
+    `emitted-attribution failed against merge-base(${base}, HEAD)@${baseSha.slice(0, 12)}:\n\n${formatReport(result)}`,
   );
 });
 
