@@ -330,6 +330,7 @@ function baseRefCandidates(env = process.env) {
  */
 function resolveBase(env = process.env, { cwd = REPO_ROOT } = {}) {
   for (const candidate of baseRefCandidates(env)) {
+    if (candidate.startsWith('-')) continue; // never let an env value reach git as an option
     try {
       const sha = git(['rev-parse', '--verify', `${candidate}^{commit}`], { cwd }).trim();
       if (/^[0-9a-f]{40}$/.test(sha)) return { ref: candidate, sha };
@@ -996,6 +997,52 @@ function readAckTrailers({ baseRef, headRef = 'HEAD', cwd = REPO_ROOT, timeoutMs
   return parseAckTrailers({ hash: hashValues, growth: growthValues });
 }
 
+/**
+ * Pin ALL THREE "before" inputs of the differential gate to the ONE merge-base sha
+ * `resolveAttributionBase` returned (#5008): the baseline, the changed-path range
+ * (`resolveChangedPaths`), and the ack-trailer range (`readAckTrailers`) must share one
+ * origin, or a change that landed only on the base side after HEAD forked shows up in
+ * baseline-vs-current while nothing in `merge-base..HEAD` explains it — the release-lane
+ * shape #5008 fixes (see `resolveAttributionBase`'s doc comment for the full story).
+ *
+ * Passing the RESOLVED SHA to each of the three, never the ref NAME, closes the other
+ * half of that bug: a ref name re-resolves live inside each call, so a fetch landing
+ * mid-run could move the changed-path range and the ack range to a newer commit than
+ * the one the baseline was built at, even though all three started from the same
+ * `attributionBase`. A sha is inert — nothing can move what it resolves to.
+ *
+ * Every dependency is injected (`resolveBaselineFn`, `buildBaselineFn`, `readJson`) so
+ * this wiring — previously inlined and untested at the real-tree test's call site — is
+ * itself testable without a real installer spawn or a live baseline cache/build.
+ *
+ * @param {{ref: string, tipSha: string, sha: string}} attributionBase `resolveAttributionBase`'s result.
+ * @param {object} [opts]
+ * @param {string} [opts.cwd]
+ * @param {function} opts.resolveBaselineFn required: a `resolveBaseline`-shaped function, `(opts) => result`
+ * @param {function} [opts.buildBaselineFn] defaults to `buildBaselineAtRef`
+ * @param {function} [opts.readJson] passed through to `resolveBaselineFn` as its own `readJson`
+ * @returns {{resolvedBaseline: object, changedPaths: string[], ack: object}} `ack` is `readAckTrailers`'s
+ *   own return shape (`{hash, growth, errors}`).
+ */
+function resolveAttributionInputs(attributionBase, {
+  cwd = REPO_ROOT,
+  resolveBaselineFn,
+  buildBaselineFn = buildBaselineAtRef,
+  readJson,
+} = {}) {
+  if (typeof resolveBaselineFn !== 'function') {
+    throw new Error('resolveAttributionInputs: resolveBaselineFn must be supplied');
+  }
+  const resolvedBaseline = resolveBaselineFn({
+    expectedSha: attributionBase.sha,
+    readJson,
+    buildFallback: () => buildBaselineFn(attributionBase.sha, { cwd }),
+  });
+  const changedPaths = resolveChangedPaths(attributionBase.sha, { cwd });
+  const ack = readAckTrailers({ baseRef: attributionBase.sha, cwd });
+  return { resolvedBaseline, changedPaths, ack };
+}
+
 module.exports = {
   REPO_ROOT,
   FIXTURE_SUBDIR,
@@ -1013,6 +1060,7 @@ module.exports = {
   baseRefCandidates,
   resolveBase,
   resolveAttributionBase,
+  resolveAttributionInputs,
   baselineFamilyNamesAtRef,
   baselineManifestsAtRef,
   baselineSizesAtRef,
