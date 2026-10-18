@@ -29,7 +29,7 @@ import {
 import type { Evidence } from './gate-evidence.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import planningWorkspaceMod = require('./planning-workspace.cjs');
-const { planningDir } = planningWorkspaceMod;
+const { planningDir, planningRoot } = planningWorkspaceMod;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import phaseLocatorMod = require('./phase-locator.cjs');
 const { findPhaseInternal } = phaseLocatorMod;
@@ -42,12 +42,18 @@ const { getRoadmapPhaseWithFallback } = roadmapModule;
 
 /**
  * Resolve a caller-supplied path (absolute, or relative to `projectDir`) and require the result to
- * stay inside `projectDir` (realpath containment, ADR-4650). Returns the contained path the
+ * stay inside `projectDir` or inside the realpath of the project's OWN `.planning` (#5474: it may be
+ * a symlink to an out-of-repo store, so its phases realpath outside `projectDir`; ADR-5057 "Two
+ * containment roots"). Both decisions go through `tryWithinRoot` (realpath containment, ADR-4650);
+ * a symlink inside the store that leaves it, `..` traversal and a name-prefix sibling of the store
+ * still fail both. Returns the contained path the
  * predicate produced, or a `GateUsageFailure` (`usage`, `path escapes its allowed directory: <arg>`).
  */
 export function resolveContainedPath(inputPath: string, projectDir: string): string | GateUsageFailure {
   const candidate = path.isAbsolute(inputPath) ? inputPath : path.join(projectDir, inputPath);
-  const contained = tryWithinRoot(candidate, projectDir, PathAcceptance.AbsoluteInsideRoot);
+  const contained =
+    tryWithinRoot(candidate, projectDir, PathAcceptance.AbsoluteInsideRoot) ??
+    tryWithinRoot(candidate, planningRoot(projectDir), PathAcceptance.AbsoluteInsideRoot);
   if (contained === null) {
     return gateUsageFailure(GATE_FAILURE_CODE.USAGE, `path escapes its allowed directory: ${inputPath}`);
   }
