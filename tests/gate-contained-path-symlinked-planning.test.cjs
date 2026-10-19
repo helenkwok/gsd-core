@@ -25,11 +25,11 @@ function seedPhase(phaseDir) {
   fs.writeFileSync(path.join(phaseDir, '01-01-PLAN.md'), '<objective>Unrelated work REQ-01</objective>\n');
 }
 
-function decisionGate(proj, phaseArg) {
-  return runGsdTools(['check', 'decision-coverage-plan', phaseArg, '--context', path.join(phaseArg, 'CONTEXT.md')], proj);
+function decisionGate(proj, phaseArg, env) {
+  return runGsdTools(['check', 'decision-coverage-plan', phaseArg, '--context', path.join(phaseArg, 'CONTEXT.md')], proj, env);
 }
-function gapGate(proj, phaseArg) {
-  return runGsdTools(['check', 'gap-analysis.plan-post', phaseArg, 'REQ-01,REQ-02', '--raw'], proj);
+function gapGate(proj, phaseArg, env) {
+  return runGsdTools(['check', 'gap-analysis.plan-post', phaseArg, 'REQ-01,REQ-02', '--raw'], proj, env);
 }
 const GATES = [['decision-coverage-plan', decisionGate], ['gap-analysis.plan-post', gapGate]];
 
@@ -68,18 +68,36 @@ describe('#5474: gate containment with a symlinked out-of-repo .planning', () =>
       fs.symlinkSync(outside, path.join(store, 'phases', 'link-out'), process.platform === 'win32' ? 'junction' : 'dir');
       const evil = path.join(root, 'store-evil');
       seedPhase(evil);
+      const store2 = path.join(root, 'store2'); // shares the store's name prefix with no separator
+      seedPhase(store2);
       for (const arg of [
         path.join('.planning', 'phases', 'link-out'),
         outside,
         path.join('.planning', '..', '..', 'outside'),
         evil,
-        path.join(store + '-evil'),
+        store2,
       ]) {
         const r = gate(proj, arg);
         assert.equal(r.success, false, `${arg} was accepted`);
         assert.ok(r.error.includes(ESCAPES), `${arg}: ${r.error}`);
       }
     });
+
+    // The second root is the project's own .planning (planningRoot), not the env-scoped planningDir:
+    // GSD_WORKSTREAM / GSD_PROJECT narrow planningDir below .planning, which would refuse these paths.
+    for (const [envName, scope] of [['GSD_WORKSTREAM', path.join('workstreams', 'ws')], ['GSD_PROJECT', 'ws']]) {
+      test(`${name}: ${envName} set still accepts the phase under the symlinked store`, () => {
+        fs.mkdirSync(path.join(store, scope), { recursive: true });
+        const env = { [envName]: 'ws' };
+        const control = gate(realProj, REL_PHASE);
+        assert.ok(control.success, `control failed: ${control.error}`);
+        for (const arg of [REL_PHASE, path.join(store, 'phases', '01-demo')]) {
+          const r = gate(proj, arg, env);
+          assert.ok(r.success, `${envName}=ws: ${arg} refused: ${r.error}`);
+          assert.equal(r.output, control.output);
+        }
+      });
+    }
 
     test(`${name}: real .planning directory still refuses an outside path`, () => {
       const outside = path.join(root, 'outside');
