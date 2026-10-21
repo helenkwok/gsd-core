@@ -62,7 +62,8 @@ describe('#5474: gate containment with a symlinked out-of-repo .planning', () =>
       }
     });
 
-    test(`${name}: still refuses an in-store symlink to outside, an outside absolute path, .. traversal and a prefix sibling`, () => {
+    // Seeds the escape cases and returns the arguments that must be refused.
+    function escapeArgs() {
       const outside = path.join(root, 'outside');
       seedPhase(outside);
       fs.symlinkSync(outside, path.join(store, 'phases', 'link-out'), process.platform === 'win32' ? 'junction' : 'dir');
@@ -70,17 +71,15 @@ describe('#5474: gate containment with a symlinked out-of-repo .planning', () =>
       seedPhase(evil);
       const store2 = path.join(root, 'store2'); // shares the store's name prefix with no separator
       seedPhase(store2);
-      for (const arg of [
-        path.join('.planning', 'phases', 'link-out'),
-        outside,
-        path.join('.planning', '..', '..', 'outside'),
-        evil,
-        store2,
-      ]) {
-        const r = gate(proj, arg);
-        assert.equal(r.success, false, `${arg} was accepted`);
-        assert.ok(r.error.includes(ESCAPES), `${arg}: ${r.error}`);
-      }
+      return [path.join('.planning', 'phases', 'link-out'), outside, path.join('.planning', '..', '..', 'outside'), evil, store2];
+    }
+    function assertRefused(arg, r, label) {
+      assert.equal(r.success, false, `${label}${arg} was accepted`);
+      assert.ok(r.error.includes(ESCAPES), `${label}${arg}: ${r.error}`);
+    }
+
+    test(`${name}: still refuses an in-store symlink to outside, an outside absolute path, .. traversal and a prefix sibling`, () => {
+      for (const arg of escapeArgs()) assertRefused(arg, gate(proj, arg), '');
     });
 
     // The second root is the project's own .planning (planningRoot), not the env-scoped planningDir:
@@ -97,7 +96,30 @@ describe('#5474: gate containment with a symlinked out-of-repo .planning', () =>
           assert.equal(r.output, control.output);
         }
       });
+
+      test(`${name}: ${envName} set still refuses every escape`, () => {
+        fs.mkdirSync(path.join(store, scope), { recursive: true });
+        const env = { [envName]: 'ws' };
+        for (const arg of escapeArgs()) assertRefused(arg, gate(proj, arg, env), `${envName}=ws: `);
+      });
     }
+
+    // Trust assumption, accepted by design (#5474 scope; see resolveContainedPath's JSDoc): the
+    // project's own .planning link is trusted, so whatever it resolves to becomes a containment root,
+    // even a broad directory. Pinned here so a change to that contract is a deliberate one.
+    test(`${name}: a .planning linked to a broad directory makes paths under it contained (by design)`, () => {
+      const broad = path.join(root, 'broad');
+      const broadProj = path.join(root, 'broad-proj');
+      fs.mkdirSync(broadProj);
+      seedPhase(path.join(broad, 'phases', '01-demo'));
+      const unrelated = path.join(broad, 'unrelated', 'dir');
+      seedPhase(unrelated);
+      fs.symlinkSync(broad, path.join(broadProj, '.planning'), process.platform === 'win32' ? 'junction' : 'dir');
+      const r = gate(broadProj, unrelated);
+      assert.ok(r.success, `${unrelated} refused: ${r.error}`);
+      // ...and outside the link target is still refused
+      assertRefused(store, gate(broadProj, store), 'broad: ');
+    });
 
     test(`${name}: real .planning directory still refuses an outside path`, () => {
       const outside = path.join(root, 'outside');
