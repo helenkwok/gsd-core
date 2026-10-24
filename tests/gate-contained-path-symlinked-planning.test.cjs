@@ -3,7 +3,10 @@
 /**
  * #5474: the gate path-containment helper (`resolveContainedPath`) must accept a phase directory
  * reached through the project's OWN symlinked, out-of-repo `.planning`, and nothing wider.
- * Covers both gates the issue names: check decision-coverage-plan and check gap-analysis.plan-post.
+ * Covers both gates the issue names (check decision-coverage-plan, check gap-analysis.plan-post) in
+ * depth, plus one accept and one refuse case for the two callers that take the path through a flag
+ * (check verify-command-paths --dir, check predicate --phase-dir). The other helper callers share
+ * the same resolveContainedPath call, which these cases exercise.
  */
 
 const { describe, test, beforeEach, afterEach } = require('node:test');
@@ -31,7 +34,22 @@ function decisionGate(proj, phaseArg, env) {
 function gapGate(proj, phaseArg, env) {
   return runGsdTools(['check', 'gap-analysis.plan-post', phaseArg, 'REQ-01,REQ-02', '--raw'], proj, env);
 }
-const GATES = [['decision-coverage-plan', decisionGate], ['gap-analysis.plan-post', gapGate]];
+// A concrete verdict field per gate, so a degradation shared by the control and the symlinked run
+// still fails: the seeded phase leaves D-01 uncovered.
+function assertDecisionVerdict(output) {
+  const v = JSON.parse(output);
+  assert.equal(v.passed, false);
+  assert.deepEqual(v.uncovered.map((d) => d.id), ['D-01']);
+}
+function assertGapVerdict(output) {
+  const v = JSON.parse(output);
+  assert.ok(v.table.includes('| CONTEXT.md | D-01 | ✗ Not covered |'), v.table);
+  assert.equal(v.counts.uncovered, 3);
+}
+const GATES = [
+  ['decision-coverage-plan', decisionGate, assertDecisionVerdict],
+  ['gap-analysis.plan-post', gapGate, assertGapVerdict],
+];
 
 describe('#5474: gate containment with a symlinked out-of-repo .planning', () => {
   let root, proj, store, realProj;
@@ -51,7 +69,7 @@ describe('#5474: gate containment with a symlinked out-of-repo .planning', () =>
 
   afterEach(() => cleanup(root));
 
-  for (const [name, gate] of GATES) {
+  for (const [name, gate, assertVerdict] of GATES) {
     test(`${name}: relative and real absolute store paths give the real-directory verdict`, () => {
       const control = gate(realProj, REL_PHASE);
       assert.ok(control.success, `control failed: ${control.error}`);
@@ -59,6 +77,7 @@ describe('#5474: gate containment with a symlinked out-of-repo .planning', () =>
         const r = gate(proj, arg);
         assert.ok(r.success, `${arg} refused: ${r.error}`);
         assert.equal(r.output, control.output);
+        assertVerdict(r.output);
       }
     });
 
@@ -71,6 +90,9 @@ describe('#5474: gate containment with a symlinked out-of-repo .planning', () =>
       seedPhase(evil);
       const store2 = path.join(root, 'store2'); // shares the store's name prefix with no separator
       seedPhase(store2);
+      // The `..` case collapses lexically (path.join) before any symlink is crossed, so it guards the
+      // lexical step and is refused on base too; the in-store `link-out` symlink is the case that
+      // exercises the second root's realpath containment.
       return [path.join('.planning', 'phases', 'link-out'), outside, path.join('.planning', '..', '..', 'outside'), evil, store2];
     }
     function assertRefused(arg, r, label) {
@@ -94,6 +116,7 @@ describe('#5474: gate containment with a symlinked out-of-repo .planning', () =>
           const r = gate(proj, arg, env);
           assert.ok(r.success, `${envName}=ws: ${arg} refused: ${r.error}`);
           assert.equal(r.output, control.output);
+          assertVerdict(r.output);
         }
       });
 
@@ -117,6 +140,7 @@ describe('#5474: gate containment with a symlinked out-of-repo .planning', () =>
       fs.symlinkSync(broad, path.join(broadProj, '.planning'), process.platform === 'win32' ? 'junction' : 'dir');
       const r = gate(broadProj, unrelated);
       assert.ok(r.success, `${unrelated} refused: ${r.error}`);
+      assertVerdict(r.output);
       // ...and outside the link target is still refused
       assertRefused(store, gate(broadProj, store), 'broad: ');
     });
@@ -129,4 +153,29 @@ describe('#5474: gate containment with a symlinked out-of-repo .planning', () =>
       assert.ok(r.error.includes(ESCAPES), r.error);
     });
   }
+
+  test('verify-command-paths --dir: accepts a phase under the symlinked store and refuses one outside', () => {
+    const r = runGsdTools(['check', 'verify-command-paths', '--dir', REL_PHASE, '--raw'], proj);
+    assert.ok(r.success, `refused: ${r.error}`);
+    assert.equal(JSON.parse(r.output).readError, null);
+    const outside = path.join(root, 'outside');
+    seedPhase(outside);
+    // This probe degrades an escape to its unresolvable payload (exit UNAVAILABLE), not a usage error.
+    const bad = runGsdTools(['check', 'verify-command-paths', '--dir', outside, '--raw'], proj);
+    assert.equal(bad.success, false, 'outside --dir was accepted');
+    assert.ok(`${bad.output}${bad.error}`.includes('--dir resolves outside the project root'), `${bad.output}${bad.error}`);
+  });
+
+  test('predicate --phase-dir: evaluates a phase under the symlinked store and refuses one outside', () => {
+    fs.writeFileSync(path.join(store, 'phases', '01-demo', 'SECURITY.md'), '---\nstatus: passed\n---\n# Security\n');
+    const predicate = JSON.stringify({ kind: 'artifact-frontmatter-equals', artifact: 'SECURITY.md', field: 'status', equals: 'passed' });
+    const r = runGsdTools(['check', 'predicate', '--predicate', predicate, '--phase-dir', REL_PHASE, '--raw'], proj);
+    assert.ok(r.success, `refused: ${r.error}`);
+    assert.equal(JSON.parse(r.output).block, false);
+    const outside = path.join(root, 'outside');
+    seedPhase(outside);
+    const bad = runGsdTools(['check', 'predicate', '--predicate', predicate, '--phase-dir', outside, '--raw'], proj);
+    assert.equal(bad.success, false, 'outside --phase-dir was accepted');
+    assert.ok(bad.error.includes(ESCAPES), bad.error);
+  });
 });
